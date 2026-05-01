@@ -187,22 +187,30 @@ func (c CredentialValidator) Valid(username, password string) bool {
 	return u&p == 1
 }
 
-// connForward copy data from `from` to `to`
+// connForward copies data from `from` to `to` until EOF/error, then
+// half-closes only `to`'s write side. The reverse-direction goroutine
+// can keep draining instead of being killed mid-stream by a full Close
+// on both ends.
 func connForward(from io.ReadWriteCloser, to io.ReadWriteCloser) {
-	defer from.Close()
-	defer to.Close()
-
 	_, err := io.Copy(to, from)
 	if err != nil {
 		errorLogger.Printf("Cannot forward traffic: %s\n", err.Error())
 	}
+	if cw, ok := to.(interface{ CloseWrite() error }); ok {
+		_ = cw.CloseWrite()
+		return
+	}
+	// Non-TCP types (stdio, etc.): fall back to full close.
+	_ = from.Close()
+	_ = to.Close()
 }
 
 // tcpClientForward starts a new connection via wireguard and forward traffic from `conn`
 func tcpClientForward(vt *VirtualTun, raddr *addressPort, conn net.Conn) {
 	target, err := vt.resolveToAddrPort(raddr)
 	if err != nil {
-		errorLogger.Printf("TCP Server Tunnel to %s: %s\n", target, err.Error())
+		errorLogger.Printf("TCP Client Tunnel to %s: %s\n", target, err.Error())
+		_ = conn.Close()
 		return
 	}
 
@@ -211,6 +219,7 @@ func tcpClientForward(vt *VirtualTun, raddr *addressPort, conn net.Conn) {
 	sconn, err := vt.Tnet.DialTCP(tcpAddr)
 	if err != nil {
 		errorLogger.Printf("TCP Client Tunnel to %s: %s\n", target, err.Error())
+		_ = conn.Close()
 		return
 	}
 
@@ -280,6 +289,7 @@ func tcpServerForward(vt *VirtualTun, raddr *addressPort, conn net.Conn) {
 	target, err := vt.resolveToAddrPort(raddr)
 	if err != nil {
 		errorLogger.Printf("TCP Server Tunnel to %s: %s\n", target, err.Error())
+		_ = conn.Close()
 		return
 	}
 
@@ -288,12 +298,12 @@ func tcpServerForward(vt *VirtualTun, raddr *addressPort, conn net.Conn) {
 	sconn, err := net.DialTCP("tcp", nil, tcpAddr)
 	if err != nil {
 		errorLogger.Printf("TCP Server Tunnel to %s: %s\n", target, err.Error())
+		_ = conn.Close()
 		return
 	}
 
 	go connForward(sconn, conn)
 	go connForward(conn, sconn)
-
 }
 
 // SpawnRoutine spawns a TCP server on wireguard which acts as a proxy to the specified target

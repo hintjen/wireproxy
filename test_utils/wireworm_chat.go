@@ -34,6 +34,8 @@ func main() {
 	var conn net.Conn
 	var err error
 
+	const greeting = "WORM\n"
+
 	if mode == "server" {
 		fmt.Printf(ColorCyan+"Chat Server listening on 127.0.0.1:%s..."+ColorNC+"\n", target)
 		ln, err := net.Listen("tcp", "127.0.0.1:"+target)
@@ -44,12 +46,43 @@ func main() {
 		if err != nil {
 			log.Fatal(err)
 		}
+		// Send a readiness greeting so the client can confirm the
+		// upstream chat server is actually here (and not just a
+		// half-open wireproxy tunnel whose far end hasn't dialed
+		// the chat server yet).
+		if _, err := conn.Write([]byte(greeting)); err != nil {
+			log.Fatalf("failed to send greeting: %v", err)
+		}
 		fmt.Println(ColorGreen + "Peer connected! Start typing (type '/ping' for RTT, Ctrl+C to quit)." + ColorNC)
 	} else {
 		fmt.Printf(ColorCyan+"Connecting to Chat Server at %s..."+ColorNC+"\n", target)
-		conn, err = net.Dial("tcp", target)
-		if err != nil {
-			log.Fatal(err)
+		// Retry connection until the host's chat server actually answers.
+		// The tunnel itself comes up before the chat server has finished
+		// starting, so a single Dial+EOF is the symptom; we re-try until
+		// we receive the greeting.
+		deadline := time.Now().Add(60 * time.Second)
+		for {
+			conn, err = net.Dial("tcp", target)
+			if err != nil {
+				if time.Now().After(deadline) {
+					log.Fatalf("dial failed: %v", err)
+				}
+				time.Sleep(1 * time.Second)
+				continue
+			}
+			conn.SetReadDeadline(time.Now().Add(3 * time.Second))
+			buf := make([]byte, len(greeting))
+			n, rerr := io.ReadFull(conn, buf)
+			conn.SetReadDeadline(time.Time{})
+			if rerr == nil && n == len(greeting) && string(buf) == greeting {
+				break
+			}
+			_ = conn.Close()
+			if time.Now().After(deadline) {
+				log.Fatal("timeout waiting for chat server greeting")
+			}
+			fmt.Println(ColorYellow + "Server not ready yet, retrying..." + ColorNC)
+			time.Sleep(1 * time.Second)
 		}
 		fmt.Println(ColorGreen + "Connected to peer! Start typing (type '/ping' for RTT, Ctrl+C to quit)." + ColorNC)
 	}

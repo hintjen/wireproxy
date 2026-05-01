@@ -35,6 +35,18 @@ if [ ! -f "./wireproxy" ]; then
     make > /dev/null
 fi
 
+# Pre-build the chat binary so the post-handshake launch is instant
+# (avoids `go run` compile time racing the joiner's client against the
+# host's server-listen).
+CHAT_BIN="./test_utils/wireworm_chat_bin"
+if [ ! -x "$CHAT_BIN" ] || [ "test_utils/wireworm_chat.go" -nt "$CHAT_BIN" ]; then
+    echo -e "${YELLOW}Building chat binary...${NC}"
+    if ! go build -o "$CHAT_BIN" ./test_utils/wireworm_chat.go; then
+        echo -e "${RED}Error: failed to build chat binary.${NC}"
+        exit 1
+    fi
+fi
+
 # 2. Key Generation
 PRIV=$(wg genkey)
 PUB=$(echo "$PRIV" | wg pubkey)
@@ -225,13 +237,17 @@ done
 # 5. File selection for sender
 FILE_TO_SEND=""
 if [[ "$SUB_MODE" == "file" && "$ROLE" == "host" ]]; then
-    echo -ne "${YELLOW}File path to send (drag file here): ${NC}"
+    echo -ne "${YELLOW}File path to send (drag file here, blank for demo dummy): ${NC}"
     read FILE_INPUT
     FILE_TO_SEND=$(echo "$FILE_INPUT" | sed "s/'//g" | sed 's/\\//g' | xargs)
-    if [ ! -f "$FILE_TO_SEND" ]; then
-        echo -e "${YELLOW}File not found. Using default dummy file.${NC}"
+    if [ -z "$FILE_TO_SEND" ]; then
         FILE_TO_SEND="wormhole_package.txt"
+        echo -e "${YELLOW}No path given. Using default dummy file: $FILE_TO_SEND${NC}"
         echo "Hello from WireWorm! This file was transferred via userspace WireGuard hole punching." > "$FILE_TO_SEND"
+    elif [ ! -f "$FILE_TO_SEND" ]; then
+        echo -e "${RED}Error: file not found: '$FILE_TO_SEND'${NC}"
+        echo -e "${RED}(Quote-stripping/escape-removal is applied to drag-dropped paths.)${NC}"
+        exit 1
     fi
 fi
 
@@ -252,9 +268,37 @@ EOF
 if [[ "$ROLE" == "host" ]]; then
     if [[ "$SUB_MODE" == "file" ]]; then
         echo -e "\n[TCPServerTunnel]\nListenPort = 9000\nTarget = 127.0.0.1:8080" >> wireworm.conf
-        echo -e "${GREEN}Starting Receiver-ready file server...${NC}"
-        go run test_utils/wireworm_sender.go "$FILE_TO_SEND" &
+        echo -e "${GREEN}Building file sender binary...${NC}"
+        SENDER_BIN="./test_utils/wireworm_sender_bin"
+        if ! go build -o "$SENDER_BIN" ./test_utils/wireworm_sender.go; then
+            echo -e "${RED}Error: failed to build sender.${NC}"
+            exit 1
+        fi
+        echo -e "${GREEN}Starting file server...${NC}"
+        "$SENDER_BIN" "$FILE_TO_SEND" >/dev/null 2>&1 &
         SERVER_PID=$!
+
+        # Wait for sender to be listening before we let wireproxy accept
+        # tunneled connections — otherwise the very first inner dial fails
+        # with ECONNREFUSED and (with the now-fixed leak) used to glue the
+        # client to a dead pipe forever.
+        echo -ne "${YELLOW}Waiting for sender on :8080... ${NC}"
+        for i in $(seq 1 30); do
+            if (echo > /dev/tcp/127.0.0.1/8080) 2>/dev/null; then
+                echo -e "${GREEN}ready${NC}"
+                break
+            fi
+            if ! kill -0 $SERVER_PID 2>/dev/null; then
+                echo -e "${RED}sender died before listening${NC}"
+                exit 1
+            fi
+            sleep 1
+        done
+        if ! (echo > /dev/tcp/127.0.0.1/8080) 2>/dev/null; then
+            echo -e "${RED}sender did not start listening within 30s${NC}"
+            kill $SERVER_PID 2>/dev/null || true
+            exit 1
+        fi
     else
         echo -e "\n[TCPServerTunnel]\nListenPort = 9002\nTarget = 127.0.0.1:8082" >> wireworm.conf
         echo -e "${GREEN}Preparing Chat Host...${NC}"
@@ -337,9 +381,9 @@ else
             # Kill the maintainer before chat starts to avoid port use/interference
             kill $MAINTAINER_PID 2>/dev/null || true
             if [[ "$ROLE" == "host" ]]; then
-                go run test_utils/wireworm_chat.go server 8082
+                "$CHAT_BIN" server 8082
             else
-                go run test_utils/wireworm_chat.go client 127.0.0.1:9003
+                "$CHAT_BIN" client 127.0.0.1:9003
             fi
             break
         fi
