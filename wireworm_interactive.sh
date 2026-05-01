@@ -35,18 +35,6 @@ if [ ! -f "./wireproxy" ]; then
     make > /dev/null
 fi
 
-# Pre-build the chat binary so the post-handshake launch is instant
-# (avoids `go run` compile time racing the joiner's client against the
-# host's server-listen).
-CHAT_BIN="./test_utils/wireworm_chat_bin"
-if [ ! -x "$CHAT_BIN" ] || [ "test_utils/wireworm_chat.go" -nt "$CHAT_BIN" ]; then
-    echo -e "${YELLOW}Building chat binary...${NC}"
-    if ! go build -o "$CHAT_BIN" ./test_utils/wireworm_chat.go; then
-        echo -e "${RED}Error: failed to build chat binary.${NC}"
-        exit 1
-    fi
-fi
-
 # 2. Key Generation
 PRIV=$(wg genkey)
 PUB=$(echo "$PRIV" | wg pubkey)
@@ -173,28 +161,45 @@ sanitize() {
 
 # 3. Mode Selection
 while true; do
-    echo -e "${BLUE}What would you like to do?${NC}"
-    echo "1) Send File"
-    echo "2) Receive File"
-    echo "3) Start Chat (Host)"
-    echo "4) Join Chat"
-    echo -ne "${YELLOW}Select [1-4]: ${NC}"
+    echo -e "${BLUE}What do you want to do?${NC}"
+    echo "1) Share a local TCP service (peer connects to your port)"
+    echo "2) Access a remote TCP service (you connect to peer's port)"
+    echo -ne "${YELLOW}Select [1-2]: ${NC}"
     read MODE
     MODE=$(sanitize "$MODE")
-    if [[ "$MODE" =~ ^[1-4]$ ]]; then break; fi
+    if [[ "$MODE" =~ ^[1-2]$ ]]; then break; fi
     echo -e "${RED}Invalid selection.${NC}"
 done
 
-if [[ "$MODE" == "1" || "$MODE" == "3" ]]; then
+# WG_TUNNEL_PORT is the port both peers use *inside* the WG tunnel.
+# Hard-coded so neither user has to coordinate it. The host's
+# wireproxy listens on it (TCPServerTunnel) and forwards to the local
+# service; the joiner's wireproxy connects to it (TCPClientTunnel)
+# and exposes the stream as a local TCP bind.
+WG_TUNNEL_PORT=9000
+
+if [[ "$MODE" == "1" ]]; then
     ROLE="host"
     WG_IP="10.0.0.1/32"
     PEER_WG_IP="10.0.0.2/32"
-    if [[ "$MODE" == "1" ]]; then SUB_MODE="file"; else SUB_MODE="chat"; fi
+    while true; do
+        echo -ne "${YELLOW}Local TCP port your service is listening on (e.g. 22, 8080): ${NC}"
+        read LOCAL_PORT
+        LOCAL_PORT=$(sanitize "$LOCAL_PORT")
+        if validate_port "$LOCAL_PORT"; then break; fi
+        echo -e "${RED}Invalid port (must be 1-65535).${NC}"
+    done
 else
     ROLE="joiner"
     WG_IP="10.0.0.2/32"
     PEER_WG_IP="10.0.0.1/32"
-    if [[ "$MODE" == "2" ]]; then SUB_MODE="file"; else SUB_MODE="chat"; fi
+    while true; do
+        echo -ne "${YELLOW}Local TCP port to bind for accessing the remote service (e.g. 2222, 9001): ${NC}"
+        read LOCAL_PORT
+        LOCAL_PORT=$(sanitize "$LOCAL_PORT")
+        if validate_port "$LOCAL_PORT"; then break; fi
+        echo -e "${RED}Invalid port (must be 1-65535).${NC}"
+    done
 fi
 
 echo -e "\n${GREEN}--- YOUR CONNECTION STRING (Share this with your peer) ---${NC}"
@@ -234,24 +239,7 @@ while true; do
     echo -e "${RED}Invalid connection string. Expected format: IP:PORT:PUBKEY${NC}"
 done
 
-# 5. File selection for sender
-FILE_TO_SEND=""
-if [[ "$SUB_MODE" == "file" && "$ROLE" == "host" ]]; then
-    echo -ne "${YELLOW}File path to send (drag file here, blank for demo dummy): ${NC}"
-    read FILE_INPUT
-    FILE_TO_SEND=$(echo "$FILE_INPUT" | sed "s/'//g" | sed 's/\\//g' | xargs)
-    if [ -z "$FILE_TO_SEND" ]; then
-        FILE_TO_SEND="wormhole_package.txt"
-        echo -e "${YELLOW}No path given. Using default dummy file: $FILE_TO_SEND${NC}"
-        echo "Hello from WireWorm! This file was transferred via userspace WireGuard hole punching." > "$FILE_TO_SEND"
-    elif [ ! -f "$FILE_TO_SEND" ]; then
-        echo -e "${RED}Error: file not found: '$FILE_TO_SEND'${NC}"
-        echo -e "${RED}(Quote-stripping/escape-removal is applied to drag-dropped paths.)${NC}"
-        exit 1
-    fi
-fi
-
-# 6. Generate Config
+# 5. Generate Config
 cat <<EOF > wireworm.conf
 [Interface]
 PrivateKey = $PRIV
@@ -266,145 +254,73 @@ PersistentKeepalive = 10
 EOF
 
 if [[ "$ROLE" == "host" ]]; then
-    if [[ "$SUB_MODE" == "file" ]]; then
-        echo -e "\n[TCPServerTunnel]\nListenPort = 9000\nTarget = 127.0.0.1:8080" >> wireworm.conf
-        echo -e "${GREEN}Building file sender binary...${NC}"
-        SENDER_BIN="./test_utils/wireworm_sender_bin"
-        if ! go build -o "$SENDER_BIN" ./test_utils/wireworm_sender.go; then
-            echo -e "${RED}Error: failed to build sender.${NC}"
-            exit 1
-        fi
-        echo -e "${GREEN}Starting file server...${NC}"
-        "$SENDER_BIN" "$FILE_TO_SEND" >/dev/null 2>&1 &
-        SERVER_PID=$!
+    cat <<EOF >> wireworm.conf
 
-        # Wait for sender to be listening before we let wireproxy accept
-        # tunneled connections — otherwise the very first inner dial fails
-        # with ECONNREFUSED and (with the now-fixed leak) used to glue the
-        # client to a dead pipe forever.
-        echo -ne "${YELLOW}Waiting for sender on :8080... ${NC}"
-        for i in $(seq 1 30); do
-            if (echo > /dev/tcp/127.0.0.1/8080) 2>/dev/null; then
-                echo -e "${GREEN}ready${NC}"
-                break
-            fi
-            if ! kill -0 $SERVER_PID 2>/dev/null; then
-                echo -e "${RED}sender died before listening${NC}"
-                exit 1
-            fi
-            sleep 1
-        done
-        if ! (echo > /dev/tcp/127.0.0.1/8080) 2>/dev/null; then
-            echo -e "${RED}sender did not start listening within 30s${NC}"
-            kill $SERVER_PID 2>/dev/null || true
-            exit 1
-        fi
-    else
-        echo -e "\n[TCPServerTunnel]\nListenPort = 9002\nTarget = 127.0.0.1:8082" >> wireworm.conf
-        echo -e "${GREEN}Preparing Chat Host...${NC}"
-        # We will start the actual chat tool AFTER wireproxy is up
-    fi
+[TCPServerTunnel]
+ListenPort = $WG_TUNNEL_PORT
+Target = 127.0.0.1:$LOCAL_PORT
+EOF
 else
-    if [[ "$SUB_MODE" == "file" ]]; then
-        echo -e "\n[TCPClientTunnel]\nBindAddress = 127.0.0.1:9001\nTarget = 10.0.0.1:9000" >> wireworm.conf
-    else
-        echo -e "\n[TCPClientTunnel]\nBindAddress = 127.0.0.1:9003\nTarget = 10.0.0.1:9002" >> wireworm.conf
-    fi
+    cat <<EOF >> wireworm.conf
+
+[TCPClientTunnel]
+BindAddress = 127.0.0.1:$LOCAL_PORT
+Target = 10.0.0.1:$WG_TUNNEL_PORT
+EOF
 fi
 
 echo -e "${CYAN}PUNCHING HOLE...${NC}"
-if [[ "$SUB_MODE" == "file" ]]; then
-    echo -e "${YELLOW}Wait for 'handshake response' logs, then download the file.${NC}"
-    if [[ "$ROLE" == "joiner" ]]; then
-        echo -e "${GREEN}Command to download: ${NC}curl http://127.0.0.1:9001/download -o downloaded_file"
-    fi
-else
-    echo -e "${YELLOW}Wait for handshake, then chat will begin.${NC}"
-fi
 
 # Start wireproxy with the info server enabled for handshake monitoring
 ./wireproxy -c wireworm.conf -i 127.0.0.1:8081 > wireproxy.log 2>&1 &
 WIREPROXY_PID=$!
 
-# Handle shutdown
-# (Cleanup is now handled by the 'cleanup' function above)
+# Handshake Monitor Loop — wait for the tunnel to come up, then keep
+# the script alive while wireproxy runs.
+echo -e "${BLUE}Waiting for handshake...${NC}"
+CONNECTED=false
+while kill -0 $WIREPROXY_PID 2>/dev/null; do
+    METRICS=$(curl -s http://127.0.0.1:8081/metrics || echo "")
+    HANDSHAKE=$(echo "$METRICS" | grep "last_handshake_time_sec" | cut -d'=' -f2 | xargs)
+    HANDSHAKE=${HANDSHAKE:-0}
+    if [[ ! "$HANDSHAKE" =~ ^[0-9]+$ ]]; then HANDSHAKE=0; fi
 
-# Handshake Monitor Loop
-if [[ "$SUB_MODE" == "file" ]]; then
-    echo -e "${BLUE}Monitoring Connection Status...${NC}"
-    (
-        CONNECTED=false
-        while kill -0 $WIREPROXY_PID 2>/dev/null; do
-            METRICS=$(curl -s http://127.0.0.1:8081/metrics || echo "")
-            HANDSHAKE=$(echo "$METRICS" | grep "last_handshake_time_sec" | cut -d'=' -f2 | xargs)
-            HANDSHAKE=${HANDSHAKE:-0}
-            if [[ ! "$HANDSHAKE" =~ ^[0-9]+$ ]]; then HANDSHAKE=0; fi
-
-            if [ "$HANDSHAKE" -gt 0 ]; then
-                if [ "$CONNECTED" = false ]; then
-                    echo -e "\n${GREEN}====================================================${NC}"
-                    echo -e "${GREEN}         🚀 SUCCESS: HOLE PUNCHED!                 ${NC}"
-                    echo -e "${GREEN}====================================================${NC}"
-                    if [[ "$OSTYPE" == "darwin"* ]]; then
-                        HS_TIME=$(date -r "$HANDSHAKE" 2>/dev/null || echo "Unknown")
-                    else
-                        HS_TIME=$(date -d @"$HANDSHAKE" 2>/dev/null || echo "Unknown")
-                    fi
-                    echo -e "${CYAN}Handshake established at: $HS_TIME${NC}"
-                    echo -e "${YELLOW}WireWorm tunnel is active.${NC}"
-                    if [[ "$ROLE" == "joiner" ]]; then
-                        echo -e "${GREEN}You can now run the curl command in another terminal.${NC}"
-                    fi
-                    CONNECTED=true
-                fi
-                sleep 30
-            else
-                echo -ne "${YELLOW}Listening for peer... (No handshake yet) \r${NC}"
-            fi
-            sleep 2
-        done
-    ) &
-    MONITOR_PID=$!
-    wait $WIREPROXY_PID
-else
-    # Chat mode: Monitor in foreground, then launch chat
-    echo -e "${BLUE}Waiting for peer to connect...${NC}"
-    while kill -0 $WIREPROXY_PID 2>/dev/null; do
-        METRICS=$(curl -s http://127.0.0.1:8081/metrics || echo "")
-        HANDSHAKE=$(echo "$METRICS" | grep "last_handshake_time_sec" | cut -d'=' -f2 | xargs)
-        HANDSHAKE=${HANDSHAKE:-0}
-        if [[ ! "$HANDSHAKE" =~ ^[0-9]+$ ]]; then HANDSHAKE=0; fi
-
-        if [ "$HANDSHAKE" -gt 0 ]; then
-            echo -e "\n${GREEN}🚀 SUCCESS: HOLE PUNCHED!${NC}"
-            echo -e "${GREEN}Starting Chat Session...${NC}"
-            # Kill the maintainer before chat starts to avoid port use/interference
-            kill $MAINTAINER_PID 2>/dev/null || true
-            if [[ "$ROLE" == "host" ]]; then
-                "$CHAT_BIN" server 8082
-            else
-                "$CHAT_BIN" client 127.0.0.1:9003
-            fi
-            break
-        fi
-        echo -ne "${YELLOW}Listening for peer... (No handshake yet) \r${NC}"
-        sleep 2
-    done
-    
-    # If we are here, something went wrong or the loop finished without break
-    if ! kill -0 $WIREPROXY_PID 2>/dev/null; then
-        echo -e "\n${RED}Error: wireproxy process died unexpectedly!${NC}"
-        echo -e "${YELLOW}--- Last logs from wireproxy.log ---${NC}"
-        if [ -f wireproxy.log ]; then
-            tail -n 30 wireproxy.log
+    if [ "$HANDSHAKE" -gt 0 ] && [ "$CONNECTED" = false ]; then
+        echo -e "\n${GREEN}====================================================${NC}"
+        echo -e "${GREEN}         🚀 SUCCESS: HOLE PUNCHED!                 ${NC}"
+        echo -e "${GREEN}====================================================${NC}"
+        if [[ "$OSTYPE" == "darwin"* ]]; then
+            HS_TIME=$(date -r "$HANDSHAKE" 2>/dev/null || echo "Unknown")
         else
-            echo "Log file not found."
+            HS_TIME=$(date -d @"$HANDSHAKE" 2>/dev/null || echo "Unknown")
         fi
-        cleanup
-        exit 1
+        echo -e "${CYAN}Handshake established at: $HS_TIME${NC}"
+        # wireproxy now keeps the NAT mapping alive; the maintainer
+        # would silently fail to bind anyway, so stop it.
+        kill $MAINTAINER_PID 2>/dev/null || true
+        echo ""
+        if [[ "$ROLE" == "host" ]]; then
+            echo -e "${YELLOW}Tunnel up.${NC} Sharing ${CYAN}127.0.0.1:$LOCAL_PORT${NC} with your peer."
+            echo -e "Make sure your service is actually listening on ${CYAN}127.0.0.1:$LOCAL_PORT${NC}."
+        else
+            echo -e "${YELLOW}Tunnel up.${NC} The remote service is reachable at ${CYAN}127.0.0.1:$LOCAL_PORT${NC}."
+            echo -e "Examples:"
+            echo -e "  ${CYAN}curl http://127.0.0.1:$LOCAL_PORT/${NC}"
+            echo -e "  ${CYAN}ssh -p $LOCAL_PORT user@127.0.0.1${NC}"
+            echo -e "  (whatever protocol the peer is sharing)"
+        fi
+        echo -e "${YELLOW}Leave this terminal running. Ctrl+C to disconnect.${NC}"
+        CONNECTED=true
+    elif [ "$CONNECTED" = false ]; then
+        echo -ne "${YELLOW}Listening for peer... (No handshake yet) \r${NC}"
     fi
+    sleep 2
+done
 
-    # Cleanup and exit cleanly
-    cleanup
-    exit 0
+# wireproxy exited
+echo -e "\n${RED}wireproxy exited.${NC}"
+if [ -f wireproxy.log ]; then
+    echo -e "${YELLOW}--- Last logs from wireproxy.log ---${NC}"
+    tail -n 30 wireproxy.log
 fi
+exit 1
